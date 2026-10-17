@@ -153,6 +153,11 @@ func TestEtcdMembershipVerify(t *testing.T) {
 		return out
 	}
 
+	// a member that joined etcd before the node got its final host name (e.g. on Hetzner Cloud)
+	withPeer := func(hostname, peerURL string) *machineapi.EtcdMember {
+		return &machineapi.EtcdMember{Id: 100, Hostname: hostname, PeerUrls: []string{peerURL}}
+	}
+
 	cpA := withNode("cp-a", "node-a", nil)
 	cpB := withNode("cp-b", "node-b", nil)
 	cpC := withNode("cp-c", "node-c", nil)
@@ -163,12 +168,32 @@ func TestEtcdMembershipVerify(t *testing.T) {
 	cpInfraName := withNode("cp-d", "node-d", nil,
 		clusterv1.MachineAddress{Type: clusterv1.MachineHostName, Address: "infra-cp-d"})
 
+	cpAddressed := withNode("cp-e", "node-e", nil,
+		clusterv1.MachineAddress{Type: clusterv1.MachineExternalIP, Address: "192.0.2.5"},
+		clusterv1.MachineAddress{Type: clusterv1.MachineExternalIP, Address: "2001:db8::5"})
+
 	tests := []struct {
 		name    string
 		owned   []clusterv1.Machine
 		members []*machineapi.EtcdMember
 		wantErr string
 	}{
+		{
+			name:    "a member that joined under a temporary host name matches its machine by peer address",
+			owned:   []clusterv1.Machine{cpA, cpAddressed},
+			members: append(members("node-a"), withPeer("talos-4y4-bo8", "https://192.0.2.5:2380")),
+		},
+		{
+			name:    "an IPv6 peer address matches in any notation",
+			owned:   []clusterv1.Machine{cpA, cpAddressed},
+			members: append(members("node-a"), withPeer("talos-4y4-bo8", "https://[2001:0db8:0000::0005]:2380")),
+		},
+		{
+			name:    "a peer address of no machine does not make a member owned",
+			owned:   []clusterv1.Machine{cpA, cpAddressed},
+			members: append(members("node-a", "node-e"), withPeer("talos-9zy-x09", "https://192.0.2.99:2380")),
+			wantErr: `etcd member "talos-9zy-x09" does not match any control plane machine`,
+		},
 		{
 			name:    "every machine has a member",
 			owned:   []clusterv1.Machine{cpA, cpB, cpC},
@@ -309,6 +334,49 @@ func TestCompareEtcdMembers(t *testing.T) {
 				t.Fatalf("compareEtcdMembers() = %v, want nil", err)
 			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
 				t.Fatalf("compareEtcdMembers() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestMemberMatches(t *testing.T) {
+	names := map[string]struct{}{"node-a": {}}
+	addresses := map[string]struct{}{"192.0.2.5": {}, "2001:db8::5": {}}
+
+	tests := []struct {
+		name   string
+		member *machineapi.EtcdMember
+		want   bool
+	}{
+		{
+			name:   "by host name, case-insensitively",
+			member: &machineapi.EtcdMember{Hostname: "Node-A"},
+			want:   true,
+		},
+		{
+			name:   "by IPv4 peer address",
+			member: &machineapi.EtcdMember{Hostname: "talos-4y4-bo8", PeerUrls: []string{"https://192.0.2.5:2380"}},
+			want:   true,
+		},
+		{
+			name:   "by IPv6 peer address in another notation",
+			member: &machineapi.EtcdMember{Hostname: "talos-4y4-bo8", PeerUrls: []string{"https://[2001:db8:0:0::5]:2380"}},
+			want:   true,
+		},
+		{
+			name:   "neither host name nor peer address",
+			member: &machineapi.EtcdMember{Hostname: "talos-9zy-x09", PeerUrls: []string{"https://192.0.2.99:2380"}},
+		},
+		{
+			name:   "an unparsable peer URL is ignored",
+			member: &machineapi.EtcdMember{Hostname: "talos-9zy-x09", PeerUrls: []string{"://192.0.2.5"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := memberMatches(tt.member, names, addresses); got != tt.want {
+				t.Fatalf("memberMatches() = %v, want %v", got, tt.want)
 			}
 		})
 	}
